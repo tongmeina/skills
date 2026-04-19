@@ -2,8 +2,9 @@
 /**
  * 在禅道中创建缺陷（REST API v1：POST /products/{id}/bugs）
  *
- * 说明：禅道「项目」与「产品」不同；列表缺陷常用项目维度，创建缺陷 API 使用产品 ID。
- * 本脚本支持用 --product-name / --project-name 自动解析产品（项目详情中可能含 product 字段）。
+ * 说明：创建缺陷的 URL 为 POST /products/{id}/bugs（产品 ID 必填）；请求体可带 project 以关联「所属项目」。
+ * 仅 --project-name 时：先读项目详情中的产品字段；若无，则调用 GET /projects/{id}/bugs（与 zentao-bugs-summary 一致）从已有缺陷推断 product。
+ * 仍无法解析时再使用 --product-id。
  *
  * 用法：
  *   node zentao-bug-create.mjs --product-name "应急" --title "xxx" --steps-file ./bug-body.txt
@@ -15,8 +16,8 @@
  *
  * 配置：同 zentao-bugs-summary.mjs（mcp.json 中 zentao.env 或环境变量）
  */
-import { readFileSync, writeFileSync } from "fs";
-import { dirname, join, resolve } from "path";
+import { readFileSync, existsSync } from "fs";
+import { basename, dirname, join, resolve } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -159,28 +160,120 @@ function pickProductIdFromProjectDetail(d) {
   return null;
 }
 
-async function resolveProductId({ productId, productName, projectName }) {
+/** 从缺陷对象解析所属产品 ID（与 zentao-bugs-summary 拉取的 bugs 结构一致） */
+function pickProductIdFromBug(b) {
+  if (!b || typeof b !== "object") return null;
+  if (typeof b.product === "number") return b.product;
+  if (b.product && typeof b.product === "object" && typeof b.product.id === "number") return b.product.id;
+  if (typeof b.productID === "number") return b.productID;
+  if (typeof b.productId === "number") return b.productId;
+  return null;
+}
+
+/**
+ * 方案一：与「按项目拉缺陷」同源接口 GET /api.php/v1/projects/{id}/bugs，
+ * 从首条（或前列）缺陷上的 product 字段推断创建新缺陷所需的产品 ID。
+ */
+async function inferProductIdFromProjectBugs(projectId) {
+  const data = await api(`/api.php/v1/projects/${projectId}/bugs`, { query: { page: 1, limit: 100 } });
+  const list = data.bugs ?? [];
+  for (const b of list) {
+    const pid = pickProductIdFromBug(b);
+    if (pid != null) return pid;
+  }
+  return null;
+}
+
+/**
+ * 解析创建缺陷所需的产品 ID，以及可选的「所属项目」（写入请求体 project 字段）。
+ * 说明：禅道 API 路径必须是 POST /products/{id}/bugs，故「产品」在接口层不可省略；
+ * 「项目」通过 body.project 关联，满足「缺陷挂到项目」的展示与统计。
+ */
+async function resolveCreateContext(args) {
+  const { productId, productName, projectName, projectId: rawProjectId } = args;
+
+  let projectForBody = null;
+
+  if (rawProjectId != null) {
+    const pid = Number(rawProjectId);
+    if (!Number.isFinite(pid)) throw new Error("--project-id 必须是数字");
+    projectForBody = { id: pid, name: `(ID ${pid})` };
+  }
+
   if (productId != null) {
     const id = Number(productId);
     if (!Number.isFinite(id)) throw new Error("--product-id 必须是数字");
-    return { productId: id, hint: `产品 ID ${id}` };
+    if (projectName && !projectForBody) {
+      const proj = await findProject(projectName);
+      projectForBody = proj;
+    }
+    const hint =
+      projectForBody && projectForBody.name
+        ? `产品 ID ${id}，关联项目「${projectForBody.name}」(ID ${projectForBody.id})`
+        : `产品 ID ${id}`;
+    return { productId: id, hint, projectForBody };
   }
+
   if (productName) {
     const p = await findProduct(productName);
-    return { productId: p.id, hint: `产品「${p.name}」(ID ${p.id})` };
+    if (projectName && !projectForBody) {
+      const proj = await findProject(projectName);
+      projectForBody = proj;
+    }
+    const hint =
+      projectForBody && projectForBody.name
+        ? `产品「${p.name}」(ID ${p.id})，关联项目「${projectForBody.name}」(ID ${projectForBody.id})`
+        : `产品「${p.name}」(ID ${p.id})`;
+    return { productId: p.id, hint, projectForBody };
   }
+
   if (projectName) {
     const proj = await findProject(projectName);
     const detail = await api(`/api.php/v1/projects/${proj.id}`);
-    const pid = pickProductIdFromProjectDetail(detail);
-    if (!pid) {
+    let inferredProductId = pickProductIdFromProjectDetail(detail);
+    let productSource = inferredProductId ? "detail" : null;
+    if (!inferredProductId) {
+      inferredProductId = await inferProductIdFromProjectBugs(proj.id);
+      productSource = inferredProductId ? "bugs" : null;
+    }
+    if (!inferredProductId) {
       console.error(
-        `项目「${proj.name}」(ID ${proj.id}) 的详情中未能解析出产品 ID。\n请改用 --product-name <关键词> 或 --product-id <数字>（在禅道界面「产品」页可看到产品 ID）。`
+        `项目「${proj.name}」(ID ${proj.id}) 无法解析产品 ID：\n` +
+          `  · 项目详情中无产品字段，且\n` +
+          `  · GET /projects/${proj.id}/bugs 无缺陷记录，或缺陷对象上无 product 字段。\n\n` +
+          `请先在该项目下至少有一条历史缺陷（与 zentao-bugs-summary 能拉到数据同源），\n` +
+          `或使用「--product-id <数字>」手动指定产品。\n`
       );
       process.exit(1);
     }
-    return { productId: pid, hint: `由项目「${proj.name}」解析到产品 ID ${pid}` };
+    const hint =
+      productSource === "bugs"
+        ? `由项目「${proj.name}」下已有缺陷推断产品 ID ${inferredProductId}（GET /projects/{id}/bugs），并关联该项目`
+        : `由项目「${proj.name}」详情解析到产品 ID ${inferredProductId}，并关联该项目`;
+    return {
+      productId: inferredProductId,
+      hint,
+      projectForBody: proj,
+    };
   }
+
+  if (rawProjectId != null && productId == null && productName == null && !projectName) {
+    const pid = Number(rawProjectId);
+    if (!Number.isFinite(pid)) throw new Error("--project-id 必须是数字");
+    const inferredProductId = await inferProductIdFromProjectBugs(pid);
+    if (!inferredProductId) {
+      console.error(
+        `项目 ID ${pid} 下无法从已有缺陷推断产品 ID（GET /projects/${pid}/bugs 无记录或无 product 字段）。请使用 --product-id。\n`
+      );
+      process.exit(1);
+    }
+    return {
+      productId: inferredProductId,
+      hint: `由项目 ID ${pid} 下已有缺陷推断产品 ID ${inferredProductId}，并关联该项目`,
+      projectForBody: { id: pid, name: `(ID ${pid})` },
+    };
+  }
+
   throw new Error("请指定 --product-id、--product-name 或 --project-name 之一");
 }
 
@@ -191,6 +284,7 @@ function parseArgs(argv) {
     if (a === "--product-id" && argv[i + 1]) args.productId = argv[++i];
     else if (a === "--product-name" && argv[i + 1]) args.productName = argv[++i];
     else if (a === "--project-name" && argv[i + 1]) args.projectName = argv[++i];
+    else if (a === "--project-id" && argv[i + 1]) args.projectId = argv[++i];
     else if (a === "--title" && argv[i + 1]) args.title = argv[++i];
     else if (a === "--steps" && argv[i + 1]) args.steps = argv[++i];
     else if (a === "--steps-file" && argv[i + 1]) args.stepsFile = argv[++i];
@@ -204,19 +298,149 @@ function parseArgs(argv) {
       args.listProducts = true;
       if (argv[i + 1] && !String(argv[i + 1]).startsWith("--")) args.listProductsKeyword = argv[++i];
     }
+    else if (a === "--attach" && argv[i + 1]) {
+      if (!args.attach) args.attach = [];
+      args.attach.push(argv[++i]);
+    }
     else if (a === "--help" || a === "-h") args.help = true;
   }
   return args;
 }
 
+/**
+ * 将纯文本/Markdown 简述转为禅道富文本可用的 HTML。
+ * - 连续空行合并，不再为每行空行生成 `<p> </p>`（避免禅道里出现大块异常空白）。
+ * - 以 `1、` `2、` 开头的连续行转为 `<ol><li>…</li></ol>`，保留「有序实际结果 / 预期」的编号。
+ */
 function stepsToHtml(s) {
   const esc = (t) =>
     String(t)
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;");
-  const lines = String(s).split(/\r?\n/);
-  return lines.map((line) => `<p>${esc(line) || " "}</p>`).join("\r\n");
+  const raw = String(s)
+    .trim()
+    .split(/\r?\n/)
+    .map((l) => l.trimEnd());
+  const lines = [];
+  for (const L of raw) {
+    if (L === "" && lines.length && lines[lines.length - 1] === "") continue;
+    lines.push(L);
+  }
+  while (lines.length && lines[0] === "") lines.shift();
+  while (lines.length && lines[lines.length - 1] === "") lines.pop();
+
+  const parts = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i] === "") {
+      i++;
+      continue;
+    }
+    if (/^\d+、/.test(lines[i])) {
+      const items = [];
+      while (i < lines.length && /^\d+、/.test(lines[i])) {
+        items.push(lines[i].replace(/^\d+、\s*/, ""));
+        i++;
+      }
+      parts.push(`<ol>${items.map((t) => `<li>${esc(t)}</li>`).join("")}</ol>`);
+      continue;
+    }
+    parts.push(`<p>${esc(lines[i])}</p>`);
+    i++;
+  }
+  return parts.join("\r\n");
+}
+
+/**
+ * 禅道 v22+：POST /api.php/v2/files（multipart）。
+ * 官方文档请求头为 **token**（小写）；v1 接口常用 **Token**（首字母大写），部分实例只认其一。
+ * 若仍失败：可能是版本低于 22、未开放 v2、或需 token 拼在 URL 上。
+ */
+async function uploadBugAttachments(bugId, paths) {
+  if (!paths?.length || !bugId) return;
+  if (!token) await login();
+
+  for (const p of paths) {
+    const fp = resolve(p);
+    if (!existsSync(fp)) {
+      console.error(`附件跳过（文件不存在）: ${fp}`);
+      continue;
+    }
+    const buf = readFileSync(fp);
+    const blob = new Blob([buf]);
+    const fileName = basename(fp);
+
+    const baseUrl = joinUrl(ZENTAO_URL, "/api.php/v2/files");
+    const attempts = [
+      {
+        name: "header token（v2 文档）",
+        run: () => {
+          const form = new FormData();
+          form.append("file", blob, fileName);
+          form.append("objectType", "bug");
+          form.append("objectID", String(bugId));
+          return fetch(baseUrl, {
+            method: "POST",
+            headers: { token },
+            body: form,
+          });
+        },
+      },
+      {
+        name: "header Token（v1 兼容）",
+        run: () => {
+          const form = new FormData();
+          form.append("file", blob, fileName);
+          form.append("objectType", "bug");
+          form.append("objectID", String(bugId));
+          return fetch(baseUrl, {
+            method: "POST",
+            headers: { Token: token },
+            body: form,
+          });
+        },
+      },
+      {
+        name: "URL ?token=（部分环境 multipart 需走查询串）",
+        run: () => {
+          const form = new FormData();
+          form.append("file", blob, fileName);
+          form.append("objectType", "bug");
+          form.append("objectID", String(bugId));
+          const u = new URL(baseUrl);
+          u.searchParams.set("token", token);
+          return fetch(u, { method: "POST", body: form });
+        },
+      },
+    ];
+
+    let lastStatus = 0;
+    let lastBody = "";
+    let ok = false;
+    for (const a of attempts) {
+      const res = await a.run();
+      const text = await res.text();
+      if (res.ok) {
+        try {
+          const j = JSON.parse(text);
+          console.error(`已上传附件: ${fileName}（${a.name}）→ ${j.url || j.id || j.status || "ok"}`);
+        } catch {
+          console.error(`已上传附件: ${fileName}（${a.name}）`);
+        }
+        ok = true;
+        break;
+      }
+      lastStatus = res.status;
+      lastBody = text;
+    }
+    if (!ok) {
+      console.error(
+        `附件上传失败 (${fileName}): HTTP ${lastStatus} ${lastBody.slice(0, 500)}\n` +
+          `提示：若 404/501 多为禅道版本未提供 v2/files；401/403 多为 token 与 v2 不兼容，请在禅道界面手动上传附件。`
+      );
+    }
+  }
 }
 
 const args = parseArgs(process.argv);
@@ -231,6 +455,9 @@ if (args.help || process.argv.length <= 2) {
 
   或：--product-name "关键词" | --product-id <数字>
 
+  --project-name  关键词，匹配项目名（可单独使用：自动解析/推断产品 ID 后创建）
+  --project-id    数字，可与 --product-id 同用；单独使用时从该项目下已有缺陷推断产品 ID
+
   --steps-file   缺陷描述全文（前置条件、步骤、实际、预期等）
   --steps        直接跟一段文字（换行用 \\n）
   --severity     默认 3  |  --pri 默认 3  |  --type 默认 others
@@ -238,6 +465,7 @@ if (args.help || process.argv.length <= 2) {
   --execution    可选，迭代/执行 ID
   --dry-run      只打印 JSON，不创建
   --list-products [关键词]  列出产品 id 与名称，可选关键词过滤名称
+  --attach <路径>  可多次；创建成功后上传到该缺陷（需禅道 v22+，POST /api.php/v2/files）
 
 禅道 API：POST /api.php/v1/products/{产品ID}/bugs
 `);
@@ -287,7 +515,7 @@ async function main() {
 
   await login();
 
-  const { productId, hint } = await resolveProductId(args);
+  const { productId, hint, projectForBody } = await resolveCreateContext(args);
   console.error(hint);
 
   const body = {
@@ -299,9 +527,12 @@ async function main() {
     openedBuild,
   };
   if (Number.isFinite(args.execution)) body.execution = args.execution;
+  if (projectForBody && Number.isFinite(Number(projectForBody.id))) {
+    body.project = Number(projectForBody.id);
+  }
 
   if (args.dryRun) {
-    console.log(JSON.stringify({ path: `/api.php/v1/products/${productId}/bugs`, body }, null, 2));
+    console.log(JSON.stringify({ path: `/api.php/v1/products/${productId}/bugs`, body, attach: args.attach || [] }, null, 2));
     return;
   }
 
@@ -316,6 +547,9 @@ async function main() {
     const base = ZENTAO_URL.replace(/\/$/, "");
     console.error(`已创建缺陷 ID: ${bugId}（请在禅道界面核对产品与项目归属）`);
     console.error(`可尝试访问: ${base}/bug-view-${bugId}.html（路径因禅道路由配置可能略有不同）`);
+    if (args.attach?.length) {
+      await uploadBugAttachments(bugId, args.attach);
+    }
   }
 }
 
