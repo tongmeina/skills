@@ -35,12 +35,12 @@ node mcp/scripts/zentao-bugs-summary.mjs --project-id 1216 --out-dir ./my-report
 
 ## 输出
 
-脚本在 `mcp/output/` 下生成两个文件，命名规则：**`{禅道项目全名}-bugs-{YYYYMMDD}.json`**（`.md` 同基名），例如 `【磐钴】位置监控平台-国际化-bugs-20260411.json`。
+脚本在 `mcp/output/` 下生成两个文件，命名规则：**`{禅道项目全名}-bugs-{YYYYMMDD}{筛选后缀}.json`**（`.md` 同基名），例如 `【磐钴】位置监控平台-国际化-bugs-20260411-creator-童美娜-no-closed.json`。
 
 | 文件 | 内容 |
 |------|------|
 | `…-bugs-YYYYMMDD.json` | 结构化数据 |
-| `…-bugs-YYYYMMDD.md` | 按 **创建者 → 状态 → 优先级** 分组的中文 Markdown 报告，含统计 |
+| `…-bugs-YYYYMMDD.md` | 按 **创建者 → 状态 → 优先级** 分组的中文 Markdown 报告，含统计；文末附 `## 附件`，逐行输出 Bug 标题（无序号） |
 
 ## 执行流程
 

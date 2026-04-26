@@ -22,16 +22,26 @@ import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-/** 项目名称 + bugs + 年月日（YYYYMMDD），去掉 Windows 非法文件名字符 */
-function buildExportBaseName(projectName) {
-  const d = new Date();
-  const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
-  const safe = String(projectName || "项目")
+function sanitizeFilePart(v) {
+  return String(v || "")
     .replace(/[\\/:*?"<>|]/g, " ")
     .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 120);
-  return `${safe}-bugs-${ymd}`;
+    .trim();
+}
+
+/** 项目名称 + bugs + 年月日（YYYYMMDD）+ 筛选后缀，去掉 Windows 非法文件名字符 */
+function buildExportBaseName(projectName, options = {}) {
+  const d = new Date();
+  const ymd = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+  const safe = sanitizeFilePart(projectName || "项目").slice(0, 120);
+  const suffixes = [];
+  if (options.creators?.length) {
+    const creatorPart = options.creators.map((c) => sanitizeFilePart(c)).filter(Boolean).join("_");
+    if (creatorPart) suffixes.push(`creator-${creatorPart}`);
+  }
+  if (options.noClosed) suffixes.push("no-closed");
+  const suffix = suffixes.length ? `-${suffixes.join("-")}` : "";
+  return `${safe}-bugs-${ymd}${suffix}`;
 }
 
 // ── 参数解析 ────────────────────────────────────────
@@ -173,8 +183,15 @@ async function resolveUserNames(accounts) {
 }
 
 // ── 中文映射 ───────────────────────────────────────
-const STATUS_CN = { active: "激活", resolved: "已解决", closed: "已关闭", postponed: "已延期" };
-const STATUS_ORDER = ["active", "resolved", "postponed", "closed"];
+// 细化激活态展示，避免 active / confirmed 显示同名导致误判为重复分组
+const STATUS_CN = {
+  active: "激活-待确认",
+  confirmed: "激活-已确认（回归不通过）",
+  resolved: "已解决",
+  closed: "已关闭",
+  postponed: "已延期",
+};
+const STATUS_ORDER = ["active", "confirmed", "resolved", "postponed", "closed"];
 function priCn(n) { return { 1: "一级", 2: "二级", 3: "三级", 4: "四级" }[n] || `优先级${n}`; }
 function statusCn(s) { return STATUS_CN[s] || s; }
 function escape(s) { return s == null ? "—" : String(s).replace(/\r?\n/g, " ").replace(/\|/g, "\\|"); }
@@ -183,6 +200,7 @@ function priRank(p) { const n = Number(p); return Number.isFinite(n) ? n : 99; }
 // ── 生成 Markdown ──────────────────────────────────
 function generateMd(bugs, meta, nameMap) {
   const L = [];
+  const attachmentByStatus = {};
   L.push(`# ${meta.projectName} — 缺陷汇总`);
   L.push("", `> 生成时间：${new Date().toISOString().slice(0, 19).replace("T", " ")}`, "");
 
@@ -213,7 +231,14 @@ function generateMd(bugs, meta, nameMap) {
     const cPri = {};
     for (const b of list) { const p = Number(b.pri); cPri[p] = (cPri[p] || 0) + 1; }
     const cp = [1, 2, 3, 4].filter((p) => cPri[p]).map((p) => `**${priCn(p)}**：${cPri[p]} 个`);
-    L.push(`- **缺陷数**：${list.length} 个（${cp.join("；")}）`, "");
+    const cSt = {};
+    for (const b of list) cSt[b.status] = (cSt[b.status] || 0) + 1;
+    const cs = STATUS_ORDER
+      .filter((st) => cSt[st])
+      .map((st) => `**${statusCn(st)}**：${cSt[st]} 个`);
+    L.push(`- **缺陷数**：${list.length} 个`);
+    L.push(`- **按状态**：${cs.join("；")}`);
+    L.push(`- **按优先级**：${cp.join("；")}`, "");
 
     const bySt = {};
     for (const b of list) (bySt[b.status] ??= []).push(b);
@@ -224,22 +249,37 @@ function generateMd(bugs, meta, nameMap) {
     });
 
     for (const st of stKeys) {
-      L.push(`#### 状态：${statusCn(st)}`, "");
+      const stCount = bySt[st].length;
+      L.push(`#### 状态：${statusCn(st)}（${stCount}）`, "");
       const byPri = {};
       for (const b of bySt[st]) { const p = Number(b.pri); (byPri[p] ??= []).push(b); }
       const priKeys = Object.keys(byPri).map(Number).sort((a, b) => a - b);
 
       for (const pk of priKeys) {
-        L.push(`##### ${priCn(pk)}`, "");
+        const priCount = byPri[pk].length;
+        L.push(`##### ${priCn(pk)}（${priCount}）`, "");
         L.push("| 创建者 | 状态 | 优先级 | 标题 |");
         L.push("| --- | --- | --- | --- |");
         for (const b of byPri[pk]) {
           L.push(`| ${cn} | ${statusCn(b.status)} | ${priCn(pk)} | ${escape(b.title)} |`);
+          const stLabel = statusCn(b.status);
+          (attachmentByStatus[stLabel] ??= []).push(escape(b.title));
         }
         L.push("");
       }
     }
     L.push("---", "");
+  }
+
+  // 报告末尾新增附件区：仅标题，不带序号
+  L.push("## 附件", "");
+  const statusEntries = Object.entries(attachmentByStatus);
+  for (const [stLabel, titles] of statusEntries) {
+    L.push(`### 状态：${stLabel}（${titles.length}）`, "");
+    for (const title of titles) {
+      L.push(title);
+    }
+    L.push("");
   }
   return L.join("\n");
 }
@@ -304,7 +344,10 @@ async function main() {
     openedByName: nameMap[b.openedBy] || b.openedBy,
     openedDate: b.openedDate, assignedTo: b.assignedTo, type: b.type,
   });
-  const exportBase = buildExportBaseName(projectName);
+  const exportBase = buildExportBaseName(projectName, {
+    creators: args.creators,
+    noClosed: args.noClosed,
+  });
   const jsonFile = join(outDir, `${exportBase}.json`);
   writeFileSync(jsonFile, JSON.stringify({ meta, total: bugs.length, bugs: bugs.map(slim) }, null, 2), "utf8");
 
