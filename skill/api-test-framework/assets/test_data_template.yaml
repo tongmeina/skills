@@ -1,0 +1,63 @@
+# {{模块名}} 测试数据 — YAML 数据驱动
+# 
+# 编写规范:
+# 1. 每条用例包含: name(用例名), 输入字段, expected(预期结果)
+# 2. 预期结果至少包含 code（业务状态码）
+# 3. 失败场景需额外包含 error_msg 用于断言错误信息
+# 4. 需要关联数据的字段使用占位符，测试代码中动态替换
+
+{{case_key}}:
+  # ========== 正向用例 ==========
+  - name: "创建成功"
+    field1: "正常值"
+    field2: "正常值"
+    expected:
+      code: 0
+      success_msg: "成功"
+
+  - name: "{{必填项为空}}"
+    field1: ""
+    field2: "正常值"
+    expected:
+      code: 1001
+      error_msg: "{{字段}}不能为空"
+
+  - name: "{{超长输入}}"
+    field1: "{{超过限制长度的字符串...}}"
+    field2: "正常值"
+    expected:
+      code: 1001
+      error_msg: "{{字段}}不能超过{{N}}个字符"
+
+  # ========== 编辑用例 ==========
+  - name: "编辑成功"
+    id: "占位符-由创建接口返回"
+    update_field: "编辑后数据"
+    expected:
+      code: 0
+
+  # ========== 删除用例 ==========
+  - name: "删除成功-资源存在"
+    id: "占位符-由创建接口返回"
+    expected:
+      code: 0
+
+  - name: "删除失败-ID不存在"
+    id: "99999999"
+    expected:
+      code: 3003
+      error_msg: "资源不存在"
+
+  # ========== 查询用例 ==========
+  - name: "查询列表正常"
+    page: 1
+    size: 10
+    expected:
+      code: 0
+
+  - name: "查询参数异常"
+    page: -1
+    size: 0
+    expected:
+      code: 1001
+      error_msg: "参数不合法"
