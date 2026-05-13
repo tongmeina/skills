@@ -310,7 +310,8 @@ function parseArgs(argv) {
 /**
  * 将纯文本/Markdown 简述转为禅道富文本可用的 HTML。
  * - 连续空行合并，不再为每行空行生成 `<p> </p>`（避免禅道里出现大块异常空白）。
- * - 以 `1、` `2、` 开头的连续行转为 `<ol><li>…</li></ol>`，保留「有序实际结果 / 预期」的编号。
+ * - 以 `1、` / `1.` / `1)` 开头的连续行转为 `<ol><li>…</li></ol>`，保留有序编号。
+ * - 入参里若包含字面量 `\n`、`\r\n`、`\t`（命令行常见情况），先解码为真实控制符。
  */
 function stepsToHtml(s) {
   const esc = (t) =>
@@ -318,7 +319,11 @@ function stepsToHtml(s) {
       .replace(/&/g, "&amp;")
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;");
-  const raw = String(s)
+  const decoded = String(s)
+    .replace(/\\r\\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .replace(/\\t/g, "\t");
+  const raw = decoded
     .trim()
     .split(/\r?\n/)
     .map((l) => l.trimEnd());
@@ -330,6 +335,7 @@ function stepsToHtml(s) {
   while (lines.length && lines[0] === "") lines.shift();
   while (lines.length && lines[lines.length - 1] === "") lines.pop();
 
+  const ORDERED_RE = /^\d+[、.)]\s*/;
   const parts = [];
   let i = 0;
   while (i < lines.length) {
@@ -337,10 +343,10 @@ function stepsToHtml(s) {
       i++;
       continue;
     }
-    if (/^\d+、/.test(lines[i])) {
+    if (ORDERED_RE.test(lines[i])) {
       const items = [];
-      while (i < lines.length && /^\d+、/.test(lines[i])) {
-        items.push(lines[i].replace(/^\d+、\s*/, ""));
+      while (i < lines.length && ORDERED_RE.test(lines[i])) {
+        items.push(lines[i].replace(ORDERED_RE, ""));
         i++;
       }
       parts.push(`<ol>${items.map((t) => `<li>${esc(t)}</li>`).join("")}</ol>`);
